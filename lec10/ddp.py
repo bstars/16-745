@@ -1,11 +1,11 @@
 """
-This file implements Differential Dynamic Programming for the quadrotor
-	m * x'' = - (u1 + u2) * sin(\theta)
-	m * y'' = (u1 + u2) * cos(\theta) - mg
-	J * \theta'' = 0.5 * l * (u2 - u1)
+This file implements Differential Dynamic Programming for
+cartpole-swing-up problem,
 
-with stage cost
-	l_n(x, u) = 0.5 * (x - x_hover)' Q (x - x_hover) + 0.5 * (u - u_hover)' R (u - u_hover)
+https://deepnote.com/workspace/Underactuated-2ed1518a-973b-4145-bd62-1768b49956a8/project/096cffe7-416e-4d51-a471-5fd526ec8fab/notebook/cartpole_balancing-378a5603bb1d465182289bc04b4dc77b
+
+
+where the goal state is [0, pi/2, 0, 0], with stage cost
 
 """
 
@@ -15,61 +15,65 @@ import torch
 from torch import nn
 import matplotlib.pyplot as plt
 
+g = 9.81
+l = 1.
+mc = 1.
+mp = 1.
 
-g = 9.81 # m/s^2
-m = 1. # kg
-l = 0.3 # meter
-J = 0.2 * m * l * l
+
 h = 0.05 # timestep, 20hz
-nx = 6
-nu = 2
-Tfinal = 7.0 # final time
-Nt = int(Tfinal / h) # number of discrete time steps
+nx = 4
+nu = 1
+Tfinal = 5.0 # final time
+Nt = int(Tfinal / h) + 1 # number of discrete time steps
 Q = np.eye(nx)
-R = 0.1 * np.eye(nu)
+QN = 100 * np.eye(nx)
+R = 0.05 * np.eye(nu)
+x_goal = np.array([0., np.pi, 0, 0])
 
-# steady state for hovering
-x_hover = np.array([0., 1., 0., 0., 0., 0.]) # 1 meter above ground
-u_hover = np.ones(2) * 0.5 * m * g
-
-
-def quadrotor_dynamics(x, u, grad):
+def cartpole_dynamics(x_, u, grad=True):
 	"""
-	m * x'' = - (u1 + u2) * sin(\theta)
-	m * y'' = (u1 + u2) * cos(\theta) - mg
-	J * \theta'' = 0.5 * l * (u2 - u1)
 
-	:param x: [x, y, theta, x', y', \theta']
-	:param u: [u1, u2]
+	:param x: [x, theta, x_dot, theta_dot]
+	:param u: [u, ]
 	:return:
 	"""
-
 	lib = torch if grad else np
+	x, theta, xd, thetad = x_
+	coef = 1 / (mc + mp * lib.sin(theta) ** 2)
+	xdd = coef * (
+			u[0] + mp * lib.sin(theta) *
+			(
+				l * thetad**2 + g * lib.cos(theta)
+			)
+	)
+	thetadd = coef / l * (
+		-u[0] * lib.cos(theta)
+		-mp * l * thetad**2 * lib.cos(theta) * lib.sin(theta)
+		-(mc + mp) * g * lib.sin(theta)
+	)
 
-	x, y, theta, xd, yd, thetad = x
-	u1, u2 = u
+	return lib.stack([xd, thetad, xdd, thetadd])
 
-	xdd = 1 / m * (u1 + u2) * lib.sin(theta)
-	ydd = 1 / m * (u1 + u2) * lib.cos(theta) - g
-	thetadd = (1 / J) * (l / 2) * (u2 - u1)
-	return lib.stack([xd, yd, thetad, xdd, ydd, thetadd])
-
-def quadrotor_dynamics_rk4(x, u, grad=True):
+def cartpole_dynamics_rk4(x, u, grad=False):
 	""" RK-4 integrator """
-	f1 = quadrotor_dynamics(x, u, grad)
-	f2 = quadrotor_dynamics(x + 0.5 * h * f1, u, grad)
-	f3 = quadrotor_dynamics(x + 0.5 * h * f2, u, grad)
-	f4 = quadrotor_dynamics(x + h * f3, u, grad)
+	f1 = cartpole_dynamics(x, u, grad)
+	f2 = cartpole_dynamics(x + 0.5 * h * f1, u, grad)
+	f3 = cartpole_dynamics(x + 0.5 * h * f2, u, grad)
+	f4 = cartpole_dynamics(x + h * f3, u, grad)
 	return x + (h / 6.0) * (f1 + 2 * f2 + 2 * f3 + f4)
 
+def rollout(x_init, u_hist):
+	x_hist = [x_init]
+	for u in u_hist:
+		x_hist.append(
+			cartpole_dynamics_rk4(x_hist[-1], u, grad=False)
+		)
+	return np.stack(x_hist)
+
 def dynamics_jacobian_aux(xu):
-	"""
-	:param: torch.tensor, [nx+nu]
-	:return:
-		jacobian: [nx, nx + nu]
-	"""
 	jacobian = torch.autograd.functional.jacobian(
-		lambda xu: quadrotor_dynamics_rk4(xu[:nx], xu[:nu], grad=True),
+		lambda xu: cartpole_dynamics_rk4(xu[:nx], xu[nx:], grad=True),
 		(xu,),
 	)[0]
 	return jacobian
@@ -86,77 +90,61 @@ def dynamics_obj_jacobian_hessian(x, u):
 		hessian: [nx, nx+nu, nx+nu]
 			hessian[i, j, k] = d^2 f(x,u)[i] / dxu[j] dxu[k]
 	"""
-	val = quadrotor_dynamics_rk4(x, u, grad=False)
+	val = cartpole_dynamics_rk4(x, u, grad=False)
 
 	xu = torch.from_numpy(np.concatenate([x, u]))
 	jacobian = dynamics_jacobian_aux(xu)
-	hessian = torch.autograd.functional.jacobian(
-		dynamics_jacobian_aux,
-		(xu, ),
-	)[0]
-	return val, jacobian.detach().numpy(), hessian.detach().numpy()
+	# hessian = torch.autograd.functional.jacobian(
+	# 	dynamics_jacobian_aux,
+	# 	(xu, ),
+	# )[0]
+	return val, jacobian.detach().numpy() # , hessian.detach().numpy()
 
 def compute_cost(x_hist, u_hist):
-	"""
-	:param x_hist: [N, nx]
-	:param u_hist: [N-1, nu]
-	:return:
-	"""
+	dx = x_hist - x_goal
 	J = 0
-	J += 0.5 * np.sum( ((x_hist - x_hover) @ Q) * (x_hist - x_hover) )
-	J += 0.5 * np.sum( ((u_hist - u_hover) @ R) * (u_hist - u_hover))
-
+	J += 0.5 * np.sum( (dx[:-1] @ Q) * dx[:-1] )
+	J += 0.5 * np.sum( dx[-1] @ QN @ dx[-1] )
+	J += 0.5 * np.sum( (u_hist @ R) * u_hist )
 	return J
-
-def rollout(x_init, u_hist):
-	"""
-	:param x_init: [nx, ]
-	:param u_hist: [N-1, nu]
-	:return:
-		x_hist: [N, nx]
-	"""
-	xs = [x_init]
-	for t in range(len(u_hist)):
-		x_new = quadrotor_dynamics_rk4(xs[-1], u_hist[t], grad=False)
-		xs.append(x_new.copy())
-	return np.stack(xs)
 
 def differential_dynamic_programming(x_init):
 	np.set_printoptions(1)
-	u_hist = np.random.randn(Nt-1, nu) * 0.01
+	u_hist = np.random.randn(Nt - 1, nu) * 0.1
 	x_hist = rollout(x_init, u_hist)
 	J = compute_cost(x_hist, u_hist)
-
+	num_iter = 0
 	while True:
-		print(J)
+		num_iter += 1
+		print(num_iter, J, x_hist.shape)
 
-		# backward pass
-		p_next = Q @ (x_hist[-1] - x_hover)
-		P_next = Q
+		p_next = QN @ (x_hist[-1] - x_goal)
+		P_next = QN
 
 		Ks = []
 		ds = []
 		dJ = 0
 
+		# backward pass
 		for t in reversed(range(Nt-1)):
+			# Compute the gradient and hessian of cost-to-go
+			f, Df = dynamics_obj_jacobian_hessian(x_hist[t], u_hist[t])
 
-			# Compute the gradient and hessian of the cost-to-go
-			f, Df, D2f = dynamics_obj_jacobian_hessian(x_hist[t], u_hist[t])
-			g = Df.T @ p_next # (P_next @ f + p_next)
-			gx = g[:nx] + Q @ (x_hist[t] - x_hover)
-			gu = g[nx:] + R @ (u_hist[t] - u_hover)
 
-			# 1st-order approximation for the dynamics
-			G = Df.T @ P_next @ Df # + np.einsum('i,ijk -> jk', p_next, D2f)
+			g = Df.T @ p_next
+			gx = g[:nx] + Q @ (x_hist[t] - x_goal)
+			gu = g[nx:] + R @ u_hist[t]
+
+			G = Df.T @ P_next @ Df
 			Gxx = G[:nx, :nx] + Q
 			Guu = G[nx:, nx:] + R
 			Gxu = G[:nx, nx:]
 			Gux = G[nx:, :nx]
 
 			# Compute the feedback policy
-			Guu_inv = np.linalg.inv(Guu)
-			K = Guu_inv @ Gux
-			d = Guu_inv @ gu
+			Guuinv = np.linalg.inv(Guu)
+			K = Guuinv @ Gux
+			d = Guuinv @ gu
 
 
 			dJ += gu @ d
@@ -166,19 +154,23 @@ def differential_dynamic_programming(x_init):
 			# Update the gradient and hessian of cost-to-go
 			P_next = Gxx + K.T @ Guu @ K - Gxu @ K - K.T @ Gux
 			p_next = gx - K.T @ gu + K.T @ Guu @ d - Gxu @ d
+
 		Ks = np.stack(Ks[::-1])
 		ds = np.stack(ds[::-1])
 
-		# forward pass with line search
+		if np.max(np.abs(ds)) < 5e-2:
+			return x_hist, u_hist
+
+		# forward pass
 		x_new = [x_init]
 		u_new = []
-		step = 0.5
+		step = 1.
 
 		for t in range(len(Ks)):
 			u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
 			u_new.append(u.copy())
 			x_new.append(
-				quadrotor_dynamics_rk4(x_new[t], u, grad=False)
+				cartpole_dynamics_rk4(x_new[t], u, grad=False)
 			)
 		x_new = np.array(x_new)
 		u_new = np.array(u_new)
@@ -186,31 +178,29 @@ def differential_dynamic_programming(x_init):
 
 		while Jnew > J - 0.01 * step * dJ:
 			step *= 0.5
+
 			x_new = [x_init]
 			u_new = []
 			for t in range(len(Ks)):
 				u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
 				u_new.append(u.copy())
 				x_new.append(
-					quadrotor_dynamics_rk4(x_new[-1], u, grad=False)
+					cartpole_dynamics_rk4(x_new[t], u, grad=False)
 				)
 			x_new = np.array(x_new)
 			u_new = np.array(u_new)
 			Jnew = compute_cost(x_new, u_new)
 
-
-		if np.max(np.abs(u_hist - u_new)) < 1e-5:
-			return x_new, u_new
-
 		x_hist = x_new.copy()
 		u_hist = u_new.copy()
 		J = Jnew
 
-
-
 if __name__ == '__main__':
-	x_init = np.array([2., 2., 0., 0., 0., 0.])
+	x_init = np.array([0, 0, 0, 0.])
 	x_hist, u_hist = differential_dynamic_programming(x_init)
-	# plt.scatter(x_hist[0,0], x_hist[0, 1], 'ro')
-	plt.plot(x_hist[:, 0], x_hist[:, 1], 'o--', markersize=4)
+	plt.plot(x_hist[:, 0], label='x')
+	plt.plot(x_hist[:, 1], label='theta')
+	plt.legend()
 	plt.show()
+
+
