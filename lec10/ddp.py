@@ -116,7 +116,8 @@ def differential_dynamic_programming(x_init):
 	num_iter = 0
 	while True:
 		num_iter += 1
-		print(num_iter, J, x_hist.shape)
+
+		print(num_iter, J)
 
 		p_next = QN @ (x_hist[-1] - x_goal)
 		P_next = QN
@@ -129,7 +130,6 @@ def differential_dynamic_programming(x_init):
 		for t in reversed(range(Nt-1)):
 			# Compute the gradient and hessian of cost-to-go
 			f, Df = dynamics_obj_jacobian_hessian(x_hist[t], u_hist[t])
-
 
 			g = Df.T @ p_next
 			gx = g[:nx] + Q @ (x_hist[t] - x_goal)
@@ -146,7 +146,6 @@ def differential_dynamic_programming(x_init):
 			K = Guuinv @ Gux
 			d = Guuinv @ gu
 
-
 			dJ += gu @ d
 			Ks.append(K.copy())
 			ds.append(d.copy())
@@ -161,7 +160,7 @@ def differential_dynamic_programming(x_init):
 		if np.max(np.abs(ds)) < 5e-2:
 			return x_hist, u_hist
 
-		# forward pass
+		# forward pass with line search
 		x_new = [x_init]
 		u_new = []
 		step = 1.
