@@ -1,205 +1,251 @@
-"""
-This file implements Differential Dynamic Programming for
-cartpole-swing-up problem,
-
-https://deepnote.com/workspace/Underactuated-2ed1518a-973b-4145-bd62-1768b49956a8/project/096cffe7-416e-4d51-a471-5fd526ec8fab/notebook/cartpole_balancing-378a5603bb1d465182289bc04b4dc77b
-
-
-where the goal state is [0, pi/2, 0, 0], with stage cost
-
-"""
-
 import numpy as np
-import cvxpy
 import torch
-from torch import nn
+import time
 import matplotlib.pyplot as plt
 
-g = 9.81
-l = 1.
-mc = 1.
-mp = 1.
 
 
-h = 0.05 # timestep, 20hz
-nx = 4
-nu = 1
-Tfinal = 5.0 # final time
-Nt = int(Tfinal / h) + 1 # number of discrete time steps
-Q = np.eye(nx)
-QN = 100 * np.eye(nx)
-R = 0.05 * np.eye(nu)
-x_goal = np.array([0., np.pi, 0, 0])
+class RK4_Dynamics():
+    def __init__(self, f, n, m, dt=0.01):
+        """
+        """
+        self.f = f
+        self.dt = dt
+        self.n = n
+        self.m = m
 
-def cartpole_dynamics(x_, u, grad=True):
-	"""
+        
 
-	:param x: [x, theta, x_dot, theta_dot]
-	:param u: [u, ]
-	:return:
-	"""
-	lib = torch if grad else np
-	x, theta, xd, thetad = x_
-	coef = 1 / (mc + mp * lib.sin(theta) ** 2)
-	xdd = coef * (
-			u[0] + mp * lib.sin(theta) *
-			(
-				l * thetad**2 + g * lib.cos(theta)
-			)
-	)
-	thetadd = coef / l * (
-		-u[0] * lib.cos(theta)
-		-mp * l * thetad**2 * lib.cos(theta) * lib.sin(theta)
-		-(mc + mp) * g * lib.sin(theta)
-	)
 
-	return lib.stack([xd, thetad, xdd, thetadd])
+    def step(self, x, u, lib=np):
+        f1 = self.f(x, u, lib)
+        f2 = self.f(x + 0.5 * self.dt * f1, u, lib)
+        f3 = self.f(x + 0.5 * self.dt * f2, u, lib)
+        f4 = self.f(x + self.dt * f3, u, lib)
+        return x + (self.dt / 6.0) * (f1 + 2 * f2 + 2 * f3 + f4)
+    
+    def step_aux(self, xu):
+        return self.step(xu[:self.n], xu[self.n:], lib=torch)
+    
+    def step_with_derivative(self, x, u, compute_hessian=False):
+        xnext = self.step(x, u)
+        xu = torch.from_numpy(np.concatenate([x, u]))
+        jacobian = torch.autograd.functional.jacobian(self.step_aux, xu)
 
-def cartpole_dynamics_rk4(x, u, grad=False):
-	""" RK-4 integrator """
-	f1 = cartpole_dynamics(x, u, grad)
-	f2 = cartpole_dynamics(x + 0.5 * h * f1, u, grad)
-	f3 = cartpole_dynamics(x + 0.5 * h * f2, u, grad)
-	f4 = cartpole_dynamics(x + h * f3, u, grad)
-	return x + (h / 6.0) * (f1 + 2 * f2 + 2 * f3 + f4)
+        if not compute_hessian:
+            return xnext, jacobian.detach().numpy()
+        
+        hessian = torch.autograd.functional.jacobian(
+            lambda xu : torch.autograd.functional.jacobian(self.step_aux, xu), xu
+        )
+        return xnext, jacobian.detach().numpy(), hessian.detach().numpy()
+    
+    
+    
+def ddp(dynamics:RK4_Dynamics, Q, Qf, qs, qf, R, rs, x_init, u_hist=None):
 
-def rollout(x_init, u_hist):
-	x_hist = [x_init]
-	for u in u_hist:
-		x_hist.append(
-			cartpole_dynamics_rk4(x_hist[-1], u, grad=False)
-		)
-	return np.stack(x_hist)
 
-def dynamics_jacobian_aux(xu):
-	jacobian = torch.autograd.functional.jacobian(
-		lambda xu: cartpole_dynamics_rk4(xu[:nx], xu[nx:], grad=True),
-		(xu,),
-	)[0]
-	return jacobian
+    """
+    This function approximately solves the LQR problem
+        min{x,u}.   \sum_{t=0}^{N-1}    0.5 * x[t]*Q*x[t] + q[t]*x[t] 
+                                        + 0.5 * u[t]*R*u[t] + r[t]*u[t]
+                    + 0.5 * x[N]*Qf*x[N] + qf*x[N] 
 
-def dynamics_obj_jacobian_hessian(x, u):
-	"""
-	Compute the function value, jacobian, and hessian of
-		x = quadrotor_rk4(x,u)
-	:param x: np.array, [nx, ]
-	:param u: np.array, [nu, ]
-	:return:
-		val: [nx, ]
-		jacobian: [nx, nx+nu]
-		hessian: [nx, nx+nu, nx+nu]
-			hessian[i, j, k] = d^2 f(x,u)[i] / dxu[j] dxu[k]
-	"""
-	val = cartpole_dynamics_rk4(x, u, grad=False)
+        s.t.        x[t+1] = dynamics.step(x[t], u[t]) for t=0,...N-1
+                    x[0] = x_init
 
-	xu = torch.from_numpy(np.concatenate([x, u]))
-	jacobian = dynamics_jacobian_aux(xu)
-	# hessian = torch.autograd.functional.jacobian(
-	# 	dynamics_jacobian_aux,
-	# 	(xu, ),
-	# )[0]
-	return val, jacobian.detach().numpy() # , hessian.detach().numpy()
+        ( Since x[0] is give, sometime we ignore the objective related to x[0] in computation )
+    """
 
-def compute_cost(x_hist, u_hist):
-	dx = x_hist - x_goal
-	J = 0
-	J += 0.5 * np.sum( (dx[:-1] @ Q) * dx[:-1] )
-	J += 0.5 * np.sum( dx[-1] @ QN @ dx[-1] )
-	J += 0.5 * np.sum( (u_hist @ R) * u_hist )
-	return J
 
-def differential_dynamic_programming(x_init):
-	np.set_printoptions(1)
-	u_hist = np.random.randn(Nt - 1, nu) * 0.1
-	x_hist = rollout(x_init, u_hist)
-	J = compute_cost(x_hist, u_hist)
-	num_iter = 0
-	while True:
-		num_iter += 1
+    def rollout(x_init, u_hist):
+        x_hist = [x_init]
+        for u in u_hist:
+            x_hist.append(
+                dynamics.step(x_hist[-1], u)
+            )
+        return np.stack(x_hist)
+    
+    
+    def compute_cost(x_hist, u_hist):
+        # dx = x_hist - x_goal
+        # J = 0
+        # J += 0.5 * np.sum( (dx[:-1] @ Q) * dx[:-1] )
+        # J += 0.5 * np.sum( dx[-1] @ QN @ dx[-1] )
+        # J += 0.5 * np.sum( (u_hist @ R) * u_hist )
 
-		print(num_iter, J)
+        J = 0
+        J += 0.5 * np.sum( (x_hist[:-1] @ Q) * x_hist[:-1] ) + np.sum(x_hist[:-1] * qs)
+        J += 0.5 * np.sum( x_hist[-1] @ Qf @ x_hist[-1] ) + np.sum(x_hist[-1] * qf)
+        J += 0.5 * np.sum( (u_hist @ R) * u_hist ) + np.sum(u_hist * rs)
+        return J
+    
+    nx = Q.shape[0]
+    nu = R.shape[0]
+    Nt = len(rs)
+    if u_hist is None:
+        u_hist = np.random.randn(Nt, nu)
+    
+    x_hist = rollout(x_init, u_hist)
+    J = compute_cost(x_hist, u_hist)
+    num_iter = 0
+    
+    while True:
+        num_iter += 1
 
-		p_next = QN @ (x_hist[-1] - x_goal)
-		P_next = QN
+        # p = QN @ (x_hist[-1] - x_goal)
+        # P = QN
 
-		Ks = []
-		ds = []
-		dJ = 0
+        p = Qf @ x_hist[-1] + qf
+        P = Qf
 
-		# backward pass
-		for t in reversed(range(Nt-1)):
-			# Compute the gradient and hessian of cost-to-go
-			f, Df = dynamics_obj_jacobian_hessian(x_hist[t], u_hist[t])
+        Ks = []
+        ds = []
+        dJ = 0
 
-			g = Df.T @ p_next
-			gx = g[:nx] + Q @ (x_hist[t] - x_goal)
-			gu = g[nx:] + R @ u_hist[t]
+        for t in reversed(range(Nt)):
 
-			G = Df.T @ P_next @ Df
-			Gxx = G[:nx, :nx] + Q
-			Guu = G[nx:, nx:] + R
-			Gxu = G[:nx, nx:]
-			Gux = G[nx:, :nx]
+            f, df, ddf = dynamics.step_with_derivative(x_hist[t], u_hist[t], compute_hessian=True)
+            dfdx = df[:,:nx]
+            dfdu = df[:,nx:]
+            temp = np.einsum('i, ijk -> jk', p, ddf)
 
-			# Compute the feedback policy
-			Guuinv = np.linalg.inv(Guu)
-			K = Guuinv @ Gux
-			d = Guuinv @ gu
+            gx = Q @ x_hist[t] + qs[t] + dfdx.T @ p
+            gu = R @ u_hist[t] + rs[t] + dfdu.T @ p
 
-			dJ += gu @ d
-			Ks.append(K.copy())
-			ds.append(d.copy())
+            Gxx = Q + dfdx.T @ P @ dfdx + temp[:nx, :nx]
+            Guu = R + dfdu.T @ P @ dfdu + temp[nx:, nx:]
+            Gxu = dfdx.T @ P @ dfdu + temp[:nx, nx:]
+            Gux = dfdu.T @ P @ dfdx + temp[nx:, :nx]
 
-			# Update the gradient and hessian of cost-to-go
-			P_next = Gxx + K.T @ Guu @ K - Gxu @ K - K.T @ Gux
-			p_next = gx - K.T @ gu + K.T @ Guu @ d - Gxu @ d
 
-		Ks = np.stack(Ks[::-1])
-		ds = np.stack(ds[::-1])
+            # f, df = dynamics.step_with_derivative(x_hist[t], u_hist[t], compute_hessian=False)
+            # dfdx = df[:,:nx]
+            # dfdu = df[:,nx:]
 
-		if np.max(np.abs(ds)) < 5e-2:
-			return x_hist, u_hist
+            # gx = Q @ x_hist[t] + qs[t] + dfdx.T @ p
+            # gu = R @ u_hist[t] + rs[t] + dfdu.T @ p
 
-		# forward pass with line search
-		x_new = [x_init]
-		u_new = []
-		step = 1.
+            # Gxx = Q + dfdx.T @ P @ dfdx 
+            # Guu = R + dfdu.T @ P @ dfdu
+            # Gxu = dfdx.T @ P @ dfdu
+            # Gux = dfdu.T @ P @ dfdx
 
-		for t in range(len(Ks)):
-			u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
-			u_new.append(u.copy())
-			x_new.append(
-				cartpole_dynamics_rk4(x_new[t], u, grad=False)
-			)
-		x_new = np.array(x_new)
-		u_new = np.array(u_new)
-		Jnew = compute_cost(x_new, u_new)
 
-		while Jnew > J - 0.01 * step * dJ:
-			step *= 0.5
+            Guuinv = np.linalg.inv(Guu)
+            K = Guuinv @ Gux
+            d = Guuinv @ gu
 
-			x_new = [x_init]
-			u_new = []
-			for t in range(len(Ks)):
-				u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
-				u_new.append(u.copy())
-				x_new.append(
-					cartpole_dynamics_rk4(x_new[t], u, grad=False)
-				)
-			x_new = np.array(x_new)
-			u_new = np.array(u_new)
-			Jnew = compute_cost(x_new, u_new)
+            dJ += gu @ d
+            Ks.append(K.copy())
+            ds.append(d.copy())
 
-		x_hist = x_new.copy()
-		u_hist = u_new.copy()
-		J = Jnew
+            P = Gxx + K.T @ Guu @ K - Gxu @ K - K.T @ Gux
+            p = gx - K.T @ gu + K.T @ Guu @ d - Gxu @ d
+
+        Ks = np.stack(Ks[::-1])
+        ds = np.stack(ds[::-1])
+
+        if np.max(np.abs(ds)) <= 1e-3:
+            return x_hist, u_hist
+        
+        x_new = [x_init]
+        u_new = []
+        step = 1.
+
+        for t in range(len(Ks)):
+            u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
+            u_new.append(u.copy())
+            x_new.append(
+                dynamics.step(x_new[t], u)
+            )
+            
+        x_new = np.stack(x_new)
+        u_new = np.stack(u_new)
+        Jnew = compute_cost(x_new, u_new)
+
+        while Jnew > J - 0.9 * step * dJ:
+            step *= 0.5
+            x_new = [x_init]
+            u_new = []
+
+            for t in range(len(Ks)):
+                u = u_hist[t] - step * ds[t] - Ks[t] @ (x_new[t] - x_hist[t])
+                u_new.append(u.copy())
+                x_new.append(
+                    dynamics.step(x_new[t], u)
+                )
+                
+            x_new = np.stack(x_new)
+            u_new = np.stack(u_new)
+            Jnew = compute_cost(x_new, u_new)
+
+        x_hist = x_new.copy()
+        u_hist = u_new.copy()
+        J = Jnew
+
+        print(num_iter, J)
+
 
 if __name__ == '__main__':
-	x_init = np.array([0, 0, 0, 0.])
-	x_hist, u_hist = differential_dynamic_programming(x_init)
-	plt.plot(x_hist[:, 0], label='x')
-	plt.plot(x_hist[:, 1], label='theta')
-	plt.legend()
-	plt.show()
+
+    """
+    This class solves the LQR problem
+        min{x,u}.   \sum_{t=0}^{N-1}    0.5 * (x[t] - x_goal) * Q * (x[t] - x_goal) + 0.5 * u[t]*R*u[t]
+                    + 0.5 * x[N]*Qf*x[N] + qf*x[N] 
+
+        s.t.        x[t+1] = dynamics.step(x[t], u[t]) for t=0,...N-1
+                    x[0] = x_init
+
+        ( Since x[0] is give, sometime we ignore the objective related to x[0] in computation )
+
+    The main function solves the cartpole swing-up problem
+        https://deepnote.com/workspace/Underactuated-2ed1518a-973b-4145-bd62-1768b49956a8/project/096cffe7-416e-4d51-a471-5fd526ec8fab/notebook/cartpole_balancing-378a5603bb1d465182289bc04b4dc77b
+    where the target state is straight up [0., np.pi, 0, 0]
+    and the starting state is straight down [0., 0., 0, 0]
+    """
+
+    dt = 0.05 # timestep, 20hz
+    nx = 4
+    nu = 1
+    Tfinal = 2 # final time
+    Nt = int(Tfinal / dt) # number of discrete time steps
+    Q = 1 * np.eye(nx)
+    Qf = 100 * np.eye(nx)
+    R = 0.05 * np.eye(nu)
+    x_goal = np.array([0., np.pi, 0, 0])
+    q = -Q @ x_goal
+    qs = np.array([q for _ in range(Nt)])
+    qf = -Qf @ x_goal
+    rs = np.zeros([Nt, nu])
 
 
+    def cartpole_dynamics(x_, u, lib=np):
+        g = 9.81
+        l = 1.
+        mc = 1.
+        mp = 1.
+
+        x, theta, xd, thetad = x_
+        coef = 1 / (mc + mp * lib.sin(theta) ** 2)
+        xdd = coef * (
+            u[0] + mp * lib.sin(theta) * (
+                l * thetad**2 + g * lib.cos(theta)
+            )
+        )
+
+        thetadd = coef / l * (
+            -u[0] * lib.cos(theta)
+            -mp * l * thetad**2 * lib.cos(theta) * lib.sin(theta)
+            -(mc + mp) * g * lib.sin(theta)
+        )
+
+        return lib.stack([xd, thetad, xdd, thetadd])
+    
+    dynamics = RK4_Dynamics(cartpole_dynamics, m=nu, n=nx, dt=dt)
+    x_hist, u_hist = ddp(dynamics, Q, Qf, qs, qf, R, rs, x_init=np.array([0., 0., 0., 0.]))
+    plt.plot(x_hist[:,0])
+    plt.plot(x_hist[:,1])
+    plt.show()
+
+   
